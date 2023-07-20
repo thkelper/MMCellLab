@@ -10,88 +10,66 @@ import mmcv
 import torch
 from mmengine.dist import get_dist_info, init_dist
 from mmengine import Config, DictAction, get_git_hash
-from .mmunet import str2bool
 from mmunet.utils import (init_random_seed, set_random_seed, 
                           get_root_logger, collect_env, setup_multi_processes)
 from mmunet.train import train_segmentor
-from mmunet.models import build_detector
+from mmunet.models import build_detector, build_segmentor
 from mmunet.datasets import build_dataset 
 
 
 def parse_args():
-    parser = argparse.ArgumentParser()
+    parser = argparse.ArgumentParser(description='Train a detector')
+    parser.add_argument('config', help='train config file path')
+    parser.add_argument('--work-dir', help='the dir to save logs and models')
+    parser.add_argument(
+        '--load-from', help='the checkpoint file to load weights from')
+    parser.add_argument(
+        '--resume-from', help='the checkpoint file to resume from')
+    parser.add_argument(
+        '--no-validate',
+        action='store_true',
+        help='whether not to evaluate the checkpoint during training')
+    # group_gpus = parser.add_mutually_exclusive_group()
+    # group_gpus.add_argument(
+    #     '--gpu-id',
+    #     type=int,
+    #     default=0,
+    #     help='id of gpu to use '
+    #     '(only applicable to non-distributed training)')
+    parser.add_argument('--seed', type=int, default=None, help='random seed')
+    parser.add_argument(
+        '--deterministic',
+        action='store_true',
+        help='whether to set deterministic options for CUDNN backend.')
+    parser.add_argument(
+        '--cfg-options',
+        nargs='+',
+        action=DictAction,
+        help='override some settings in the used config, the key-value pair '
+        'in xxx=yyy format will be merged into config file. If the value to '
+        'be overwritten is a list, it should be like key="[a,b]" or key=a,b '
+        'It also allows nested list/tuple values, e.g. key="[(a,b),(c,d)]" '
+        'Note that the quotation marks are necessary and that no white space '
+        'is allowed.')
+    parser.add_argument(
+        '--launcher',
+        choices=['none', 'pytorch', 'slurm', 'mpi'],
+        default='pytorch',
+        help='job launcher')
+    parser.add_argument('--local_rank', type=int, default=0)
+    parser.add_argument(
+        '--auto-resume',
+        action='store_true',
+        help='resume from the latest checkpoint automatically.'),
+    parser.add_argument(
+        '--only_eval',
+        action='store_true',)
 
-    parser.add_argument('--name', default="month3_train_input_512",
-                        help='model name: (default: arch+timestamp)')
-    parser.add_argument('--epochs', default=100, type=int, metavar='N',
-                        help='number of total epochs to run')
-    parser.add_argument('-b', '--batch_size', default=1, type=int,
-                        metavar='N', help='mini-batch size (default: 16)')
-    
-    # model
-    parser.add_argument('--arch', '-a', metavar='ARCH', default='NestedUNet',
-                        choices=ARCH_NAMES,
-                        help='model architecture: ' +
-                        ' | '.join(ARCH_NAMES) +
-                        ' (default: NestedUNet)')
-    parser.add_argument('--deep_supervision', default=False, type=str2bool)
-    parser.add_argument('--input_channels', default=3, type=int,
-                        help='input channels') 
-    parser.add_argument('--num_classes', default=1, type=int,
-                        help='number of classes')
-    parser.add_argument('--input_w', default=512, type=int,
-                        help='image width')
-    parser.add_argument('--input_h', default=512, type=int,
-                        help='image height')
-    
-    # loss
-    parser.add_argument('--loss', default='BCEDiceLoss',
-                        choices=LOSS_NAMES,
-                        help='loss: ' +
-                        ' | '.join(LOSS_NAMES) +
-                        ' (default: BCEDiceLoss)')
-    
-    # dataset
-    parser.add_argument('--ann_file_path', default="/mnt/d/ycp/pku/unet++/input/month3/all_info.txt")
-    parser.add_argument('--dataset', default='month3_1024',
-                        help='dataset name')
-    parser.add_argument('--img_ext', default='.png',
-                        help='image file extension')
-    parser.add_argument('--mask_ext', default='.png',
-                        help='mask file extension')
+    args = parser.parse_args()
+    if 'LOCAL_RANK' not in os.environ:
+        os.environ['LOCAL_RANK'] = str(args.local_rank)
 
-    # optimizer
-    parser.add_argument('--optimizer', default='SGD',
-                        choices=['Adam', 'SGD'],
-                        help='loss: ' +
-                        ' | '.join(['Adam', 'SGD']) +
-                        ' (default: Adam)')
-    parser.add_argument('--lr', '--learning_rate', default=1e-3, type=float,
-                        metavar='LR', help='initial learning rate')
-    parser.add_argument('--momentum', default=0.9, type=float,
-                        help='momentum')
-    parser.add_argument('--weight_decay', default=1e-4, type=float,
-                        help='weight decay')
-    parser.add_argument('--nesterov', default=False, type=str2bool,
-                        help='nesterov')
-
-    # scheduler
-    parser.add_argument('--scheduler', default='CosineAnnealingLR',
-                        choices=['CosineAnnealingLR', 'ReduceLROnPlateau', 'MultiStepLR', 'ConstantLR'])
-    parser.add_argument('--min_lr', default=1e-5, type=float,
-                        help='minimum learning rate')
-    parser.add_argument('--factor', default=0.1, type=float)
-    parser.add_argument('--patience', default=2, type=int)
-    parser.add_argument('--milestones', default='1,2', type=str)
-    parser.add_argument('--gamma', default=2/3, type=float)
-    parser.add_argument('--early_stopping', default=-1, type=int,
-                        metavar='N', help='early stopping (default: -1)')
-    
-    parser.add_argument('--num_workers', default=0, type=int)
-
-    config = parser.parse_args()
-
-    return config
+    return args
 
 def main():
     args = parse_args()
@@ -168,7 +146,8 @@ def main():
     meta['seed'] = seed
     meta['exp_name'] = osp.basename(args.config)
 
-    model = build_detector(cfg.model)
+    # model = build_detector(cfg.model)
+    model = build_segmentor(cfg.model)
 
     # s = torch.load('/home/yangwu/workspace/image_forgery_detection/code/records/'\
     #             'defact24k_casia2_transforensics_baseline_wo_fusion_thresh_512_'\

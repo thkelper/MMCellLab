@@ -1,8 +1,8 @@
 import torch
 import torch.nn as nn
-from .builder import BACKBONES
+from .builder import BASE_MODELS 
 
-__all__ == ['Unet', 'NestedUnet']
+# __all__ == ['Unet', 'NestedUnet']
 
 
 class VGGBlock(nn.Module):
@@ -26,7 +26,7 @@ class VGGBlock(nn.Module):
         return out
 
 
-@BACKBONES.register_module()
+@BASE_MODELS.register_module()
 class UNet(nn.Module):
     def __init__(self, num_classes, input_channels=3, vis_feature=True, **kwargs):
         super().__init__()
@@ -71,7 +71,7 @@ class UNet(nn.Module):
         
         return output
 
-@BACKBONES.register_module()
+@BASE_MODELS.register_module()
 class NestedUNet(nn.Module):
     def __init__(self, num_classes, input_channels=3, deep_supervision=False, vis_feature=False, **kwargs):
         super().__init__()

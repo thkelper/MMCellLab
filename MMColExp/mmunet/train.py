@@ -1,5 +1,4 @@
 import torch
-from mmcv import MMDistributedDataParallel
 from mmcv.parallel import MMDistributedDataParallel
 from mmcv.runner import HOOKS, build_optimizer, build_runner
 from mmengine import build_from_cfg
@@ -22,7 +21,7 @@ def train_segmentor(model,
         build_dataloader(
             ds,
             cfg.data.samples_per_gpu,
-            cfg.data_workers_per_gpu,
+            cfg.data.workers_per_gpu,
             dist=distributed,
             seed = cfg.seed,
             drop_last=True
@@ -49,8 +48,8 @@ def train_segmentor(model,
         cfg.runner = {"type": "IterBasedRunner", 'max_iters': cfg.total_iters}
     
     runner = build_runner(
-        cfg,runner,
-        dafault_args=dict(
+        cfg.runner,
+        default_args=dict(
             model=model,
             batch_processor=None,
             optimizer=optimizer,
@@ -114,7 +113,7 @@ def train_segmentor(model,
         runner.load_checkpoint(cfg.load_from)
 
     if not only_eval:
-        runner.run(data_loaders, cfg.work_flow)
+        runner.run(data_loaders, cfg.workflow)
     else:
         for val_hood in eval_hooks:
             val_hood._do_evaluate(runner)

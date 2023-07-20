@@ -22,8 +22,6 @@ from albumentations import ImageCompression, OneOf
 from albumentations import OpticalDistortion as AlbuOpticalDistortion
 from albumentations import IAAPerspective as AlbuIAAPerspective
 from albumentations.pytorch.functional import img_to_tensor
-from .dct_pipelines import (LoadImageFromFileDCTMask, 
-                            LoadImageFromFileDCTMaskResize)
 from .builder import PIPELINES
 
 

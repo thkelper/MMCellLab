@@ -14,6 +14,7 @@ import warnings
 from ..utils.evaluate import (intersect_and_union, eval_metrics, pre_eval_to_metrics,
                             calculate_auc, calculate_img_score)
 from prettytable import PrettyTable
+from .pipelines import Compose, LoadAnnotations
 from sklearn import metrics
             
 
@@ -108,7 +109,7 @@ class MMDataset(torch.utils.data.Dataset):
                  reduce_zero_label=False,
                  classes=None,
                  palette=None,
-                 gt_set_map_loader_cfg=None,
+                 gt_seg_map_loader_cfg=None,
                  simulate_p=0.5,
                  dataset_name='',
                  **unused_kwargs,
@@ -132,6 +133,9 @@ class MMDataset(torch.utils.data.Dataset):
         self.label_map = None
         self.CLASSES, self.PALETTE = self.get_classes_and_palette
 
+        self.gt_seg_map_loader = LoadAnnotations(binary=True
+        ) if gt_seg_map_loader_cfg is None else LoadAnnotations(
+            **gt_seg_map_loader_cfg)
         self.dataset_name = dataset_name
 
         if test_mode:
@@ -490,77 +494,83 @@ class MMDataset(torch.utils.data.Dataset):
         return eval_results
 
 
-
-
-
-
-
-
-
-
-
-
-
-
-
-
 @DATASETS.register_module()
-class DatasetV2(torch.utils.data.Dataset):
-    def __init__(self, img_ids, ann_list,  transform=None, mode="train", data_root=None):
-        
-        self.img_ids = img_ids
-        self.ann_list = ann_list
-        self.transform = transform
-        self.mode = mode
+class MMDatasetV2(MMDataset):
+    def __init__(self,
+                 pipeline,
+                 data_root,
+                 ann_path,
+                 edge_mask_dir=None,
+                 test_mode=False,
+                 ignore_index=None,
+                 reduce_zero_label=False,
+                 classes=None,
+                 palette=None,
+                 gt_seg_map_loader_cfg=None,
+                 simulate_p=0.0,
+                 dataset_name=''):
+        self.pipeline_cfg = pipeline
+        self.pre_pipelines = None
+        if mmcv.is_list_of(pipeline, list):
+            self.pre_pipelines = Compose(pipeline[0])
+            self.post_pipelines = Compose(pipeline[1])
+        else:
+            self.post_pipelines = Compose(pipeline)
+
         self.data_root = data_root
+        self.ann_path = ann_path
+        self.edge_mask_dir = edge_mask_dir
+        self.test_mode = test_mode
+        self.ignore_index = ignore_index
+        self.reduce_zero_label = reduce_zero_label
+        self.label_map = None
+        self.CLASSES, self.PALETTE = self.get_classes_and_palette(
+            classes, palette)
+        self.gt_seg_map_loader = LoadAnnotations(binary=True
+        ) if gt_seg_map_loader_cfg is None else LoadAnnotations(
+            **gt_seg_map_loader_cfg)
+        self.simulate_p = simulate_p
+        self.dataset_name = dataset_name
+
+        if test_mode:
+            assert self.CLASSES is not None, \
+                '`cls.CLASSES` or `classes` should be specified when testing'
+
+        # load annotations
+        self.img_infos = self.load_annotations()
 
     def __len__(self):
-        return len(self.img_ids)
+        return len(self.img_infos)
 
-    def __getitem__(self, idx):
-        img_id = self.img_ids[idx]
-        # img_fpath, mask_fpath = self.ann_list[img_id].split(" ") 
-         
-        
-        if self.mode == "train":
-            img_fpath, mask_fpath = img_id.split(" ")
-            if self.data_root:
-                img_fpath = osp.join(self.data_root, img_fpath)
-                mask_fpath = osp.join(self.data_root, mask_fpath)
-                if not osp.exists(img_fpath):
-                    print(img_fpath)
-                if not osp.exists(mask_fpath):
-                    print(mask_fpath)
-            img = cv2.imread(img_fpath)
-            # print(f"img.shape:{img.shape}")
-            mask = cv2.imread(mask_fpath)
-            # print(f"img.shape:{img.shape}")
-        elif self.mode == "infer": 
-            img_fpath = img_id.strip()
-            # print(f"before:{img_fpath}")
-            img_fpath = osp.join(self.data_root, img_fpath)
-            # print(f"after:{img_fpath}")
-            img = cv2.imread(img_fpath)
-            mask = np.zeros_like(img)
+    def load_annotations(self):
+        img_infos = []
 
-        # mask = []
-        # for i in range(self.num_classes):
-        #     mask.append(cv2.imread(os.path.join(self.mask_dir, str(i),
-        #                 img_id + self.mask_ext), cv2.IMREAD_GRAYSCALE)[..., None])
-        # mask = np.dstack(mask) 
-        img = np.array(img)
-        mask = np.array(mask)
-        if self.transform is not None:
-            # print(f"img.shape:{img.shape}   mask.shape:{mask.shape}")
-            augmented = self.transform(image=img, mask=mask)#这个包比较方便，能把mask也一并做掉
-            img = augmented['image']#参考https://github.com/albumentations-team/albumentations
-            mask = augmented['mask']
-        
-        img = img.astype('float32') / 255
-        img = img.transpose(2, 0, 1)
-        mask = mask.astype('float32') / 255
-        mask = mask.transpose(2, 0, 1)
-        mask = mask[0,:,:]
-        mask = mask[np.newaxis, :, :]
-        img_fname = "_".join(img_fpath.split('/')[-3:]) 
-        return img, mask, {'img_id': img_fname, 'img_fpath': img_fpath} 
+        anno_path = osp.join(self.data_root, self.ann_path)
+        with open(anno_path) as f:
+            lines = [line.strip() for line in f.readlines()]
+    
+        for line in lines:
+            try:
+                img_path, gt_path_= line.split(' ')
+            except Exception as e:
+                print(line)
+                raise e
+
+            img_path = osp.join(self.data_root, img_path)
+            gt_path = osp.join(self.data_root, gt_path_)
+
+            if not osp.isfile(img_path):
+                continue
+            if gt_path_ != 'None' and not osp.isfile(gt_path):
+                continue
+
+            img_info = dict(filename=img_path)
+            img_info['ann'] = dict(seg_map=gt_path)
+            if self.edge_mask_dir:
+                img_info['ann']['edge_mask'] = osp.join(self.edge_mask_dir, osp.basename(gt_path))
+            img_infos.append(img_info)                
+
+        # img_infos = sorted(img_infos, key=lambda x: x['filename'])
+
+        print_log(f'Loaded {len(img_infos)} images', logger=get_root_logger())
+        return img_infos

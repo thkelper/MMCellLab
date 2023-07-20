@@ -4,7 +4,10 @@ import numpy as np
 import torch
 
 from mmengine.dist import get_dist_info
-from mmengine import Registry, build_from_cfg, digit_version
+from mmcv.utils import Registry, build_from_cfg
+# from mmengine import Registry, build_from_cfg, digit_version
+from mmengine import digit_version
+from mmcv.parallel import collate
 from torch.utils.data import DataLoader, DistributedSampler
 
 DATASETS = Registry("dataset")
@@ -83,8 +86,7 @@ def build_dataloader(dataset,
             batch_size=batch_size,
             sampler=sampler,
             num_workers=num_workers,
-            samples_per_gpu=samples_per_gpu,
-            #collate_fn=partial(collate, samples_per_gpu=samples_per_gpu),
+            # collate_fn=partial(collate, samples_per_gpu=samples_per_gpu),
             pin_memory=pin_memory,
             shuffle=shuffle,
             worker_init_fn=init_fn,
@@ -97,7 +99,7 @@ def build_dataloader(dataset,
             batch_size=batch_size,
             sampler=sampler,
             num_workers=num_workers,
-            #collate_fn=partial(collate, samples_per_gpu=samples_per_gpu),
+            collate_fn=partial(collate, samples_per_gpu=samples_per_gpu),
             samples_per_gpu=samples_per_gpu,
             pin_memory=pin_memory,
             shuffle=shuffle,
