@@ -1,188 +1,145 @@
-import cv2
-cv2.setNumThreads(0)
-import argparse
-import copy
-import os
-import os.path as osp
-import time
-import warnings
-import mmcv
 import torch
-from mmengine.dist import get_dist_info, init_dist
-from mmengine import Config, DictAction, get_git_hash
-from mmunet.utils import (init_random_seed, set_random_seed, 
-                          get_root_logger, collect_env, setup_multi_processes)
-from mmunet.train import train_segmentor
-from mmunet.models import build_detector, build_segmentor
-from mmunet.datasets import build_dataset 
+from mmcv.parallel import MMDistributedDataParallel
+from mmcv.runner import HOOKS, build_optimizer, build_runner
+from mmcv.utils import build_from_cfg
+from .datasets import build_dataset, build_dataloader
+from .utils import get_root_logger, find_latest_checkpoint
+from .utils.evaluate import EvalHook, DistEvalHook, dataloader_test
 
 
-def parse_args():
-    parser = argparse.ArgumentParser(description='Train a detector')
-    parser.add_argument('config', help='train config file path')
-    parser.add_argument('--work-dir', help='the dir to save logs and models')
-    parser.add_argument(
-        '--load-from', help='the checkpoint file to load weights from')
-    parser.add_argument(
-        '--resume-from', help='the checkpoint file to resume from')
-    parser.add_argument(
-        '--no-validate',
-        action='store_true',
-        help='whether not to evaluate the checkpoint during training')
-    # group_gpus = parser.add_mutually_exclusive_group()
-    # group_gpus.add_argument(
-    #     '--gpu-id',
-    #     type=int,
-    #     default=0,
-    #     help='id of gpu to use '
-    #     '(only applicable to non-distributed training)')
-    parser.add_argument('--seed', type=int, default=None, help='random seed')
-    parser.add_argument(
-        '--deterministic',
-        action='store_true',
-        help='whether to set deterministic options for CUDNN backend.')
-    parser.add_argument(
-        '--cfg-options',
-        nargs='+',
-        action=DictAction,
-        help='override some settings in the used config, the key-value pair '
-        'in xxx=yyy format will be merged into config file. If the value to '
-        'be overwritten is a list, it should be like key="[a,b]" or key=a,b '
-        'It also allows nested list/tuple values, e.g. key="[(a,b),(c,d)]" '
-        'Note that the quotation marks are necessary and that no white space '
-        'is allowed.')
-    parser.add_argument(
-        '--launcher',
-        choices=['none', 'pytorch', 'slurm', 'mpi'],
-        default='pytorch',
-        help='job launcher')
-    parser.add_argument('--local_rank', type=int, default=0)
-    parser.add_argument(
-        '--auto-resume',
-        action='store_true',
-        help='resume from the latest checkpoint automatically.'),
-    parser.add_argument(
-        '--only_eval',
-        action='store_true',)
+def train_segmentor(model,
+                    dataset,
+                    cfg,
+                    distributed=False,
+                    validate=False,
+                    timestamp=None,
+                    meta=None,
+                    only_eval=False):
+    """Launch segmentor training."""
+    logger = get_root_logger(cfg.log_level)
 
-    args = parser.parse_args()
-    if 'LOCAL_RANK' not in os.environ:
-        os.environ['LOCAL_RANK'] = str(args.local_rank)
+    # prepare data loaders
+    dataset = dataset if isinstance(dataset, (list, tuple)) else [dataset]
+    data_loaders = [
+        build_dataloader(
+            ds,
+            cfg.data.samples_per_gpu,
+            cfg.data.workers_per_gpu,
+            # cfg.gpus will be ignored if distributed
+            # len(cfg.gpu_ids),
+            # 1,
+            dist=distributed,
+            seed=cfg.seed,
+            drop_last=True) for ds in dataset
+    ]
 
-    return args
+    # put model on gpus
+    if distributed:
+        if 'norm_cfg' in cfg and cfg.norm_cfg.type == 'SyncBN':
+            model = torch.nn.SyncBatchNorm.convert_sync_batchnorm(model)
 
-def main():
-    args = parse_args()
+        find_unused_parameters = cfg.get('find_unused_parameters', False)
+        # Sets the `find_unused_parameters` parameter in
+        # torch.nn.parallel.DistributedDataParallel
+        model = MMDistributedDataParallel(
+            model.cuda(),
+            device_ids=[torch.cuda.current_device()],
+            broadcast_buffers=False,
+            find_unused_parameters=find_unused_parameters)
 
-    cfg = Config.fromfile(args.config)
-    if args.cfg_options is not None:
-        cfg.merge_from_dict(args.cfg_options)
+    # build runner
+    optimizer = build_optimizer(model, cfg.optimizer)
 
-    # set cudnn_benchmark
-    if cfg.get('cudnn_benchmark', False):
-        torch.backends.cudnn.benchmark = True
+    if cfg.get('runner') is None:
+        cfg.runner = {'type': 'IterBasedRunner', 'max_iters': cfg.total_iters}
 
-    # work_dir is determined in this priority: CLI > segment in file > filename
-    if args.work_dir is not None:
-        # update configs according to CLI args if args.work_dir is not None
-        cfg.work_dir = args.work_dir
-    elif cfg.get('work_dir', None) is None:
-        # use config filename as default work_dir if cfg.work_dir is None
-        cfg.work_dir = osp.join('./work_dirs',
-                                osp.splitext(osp.basename(args.config))[0])
-    if args.load_from is not None:
-        cfg.load_from = args.load_from
-    if args.resume_from is not None:
-        cfg.resume_from = args.resume_from
+    runner = build_runner(
+                    cfg.runner,
+                    default_args=dict(
+                        model=model,
+                        batch_processor=None,
+                        optimizer=optimizer,
+                        work_dir=cfg.work_dir,
+                        logger=logger,
+                        meta=meta))
 
-    # cfg.gpu_ids = [args.gpu_id]
-    cfg.auto_resume = args.auto_resume
+    # register hooks
+    runner.register_training_hooks(cfg.lr_config,
+                                   cfg.optimizer_config,
+                                   cfg.checkpoint_config,
+                                   cfg.log_config,
+                                   cfg.get('momentum_config', None))
 
-    # init distributed env first, since logger depends on the dist info.
-    if args.launcher == 'none':
-        distributed = False
+    # an ugly walkaround to make the .log and .log.json filenames the same
+    runner.timestamp = timestamp
+
+    eval_hooks = []
+    eval_dataloaders = []
+    # register eval hooks
+    if validate:
+        vals = cfg.data.val
+        if not isinstance(vals, list):
+            vals = [vals]
+        for val in vals:
+            val_dataset = build_dataset(val, dict(test_mode=True))
+            val_dataloader = build_dataloader(
+                val_dataset,
+                samples_per_gpu=1,
+                workers_per_gpu=cfg.data.workers_per_gpu,
+                dist=distributed,
+                shuffle=False)
+            eval_cfg = cfg.get('evaluation', {})
+            eval_cfg['by_epoch'] = cfg.runner['type'] != 'IterBasedRunner'
+            eval_hook = DistEvalHook if distributed else EvalHook
+            # In this PR (https://github.com/open-mmlab/mmcv/pull/1193), the
+            # priority of IterTimerHook has been modified from 'NORMAL' to 'LOW'.
+
+            h = eval_hook(val_dataloader, **eval_cfg)
+            runner.register_hook(h, priority='LOW')
+
+            eval_hooks.append(h)
+            eval_dataloaders.append(val_dataloader)
+
+    # user-defined hooks
+    if cfg.get('custom_hooks', None):
+        custom_hooks = cfg.custom_hooks
+        assert isinstance(custom_hooks, list), \
+            f'custom_hooks expect list type, but got {type(custom_hooks)}'
+        for hook_cfg in cfg.custom_hooks:
+            assert isinstance(hook_cfg, dict), \
+                'Each item in custom_hooks expects dict type, but got ' \
+                f'{type(hook_cfg)}'
+            hook_cfg = hook_cfg.copy()
+            priority = hook_cfg.pop('priority', 'NORMAL')
+            hook = build_from_cfg(hook_cfg, HOOKS)
+            runner.register_hook(hook, priority=priority)
+
+    if cfg.resume_from is None and cfg.get('auto_resume'):
+        resume_from = find_latest_checkpoint(cfg.work_dir)
+        if resume_from is not None:
+            cfg.resume_from = resume_from
+    if cfg.resume_from:
+        runner.resume(cfg.resume_from)
+    elif cfg.load_from:
+        runner.load_checkpoint(cfg.load_from)
+
+    if not only_eval:
+        runner.run(data_loaders, cfg.workflow)
     else:
-        distributed = True
-        # PORT = os.getenv('PORT')
-        # cfg.dist_params['init_method'] = f'tcp://127.0.0.1:{PORT}'
-        init_dist(args.launcher, **cfg.dist_params)
-        # gpu_ids is used to calculate iter when resuming checkpoint
-        _, world_size = get_dist_info()
-        cfg.gpu_ids = range(world_size)
+        for val_hood in eval_hooks:
+            val_hood._do_evaluate(runner)
 
-    # create work_dir
-    mmcv.mkdir_or_exist(osp.abspath(cfg.work_dir))
-    # dump config
-    cfg.dump(osp.join(cfg.work_dir, osp.basename(args.config)))
-    # init the logger before other steps
-    timestamp = time.strftime('%Y%m%d_%H%M%S', time.localtime())
-    log_file = osp.join(cfg.work_dir, f'{timestamp}.log')
-    logger = get_root_logger(log_file=log_file, log_level=cfg.log_level)
-
-    # set multi-process settings
-    setup_multi_processes(cfg)
-
-    # init the meta dict to record some important information such as
-    # environment info and seed, which will be logged
-    meta = dict()
-    # log env info
-    env_info_dict = collect_env()
-    env_info = '\n'.join([f'{k}: {v}' for k, v in env_info_dict.items()])
-    dash_line = '-' * 60 + '\n'
-    logger.info('Environment info:\n' + dash_line + env_info + '\n' +
-                dash_line)
-    meta['env_info'] = env_info
-
-    # log some basic info
-    logger.info(f'Distributed training: {distributed}')
-    logger.info(f'Config:\n{cfg.pretty_text}')
-
-    # set random seeds
-    seed = init_random_seed(args.seed)
-    logger.info(f'Set random seed to {seed}, '
-                f'deterministic: {args.deterministic}')
-    set_random_seed(seed, deterministic=args.deterministic)
-    cfg.seed = seed
-    meta['seed'] = seed
-    meta['exp_name'] = osp.basename(args.config)
-
-    # model = build_detector(cfg.model)
-    model = build_segmentor(cfg.model)
-
-    # s = torch.load('/home/yangwu/workspace/image_forgery_detection/code/records/'\
-    #             'defact24k_casia2_transforensics_baseline_wo_fusion_thresh_512_'\
-    #             'seg_loss_weight_revert_pvtv2_b2_out_layer_1_mlp_dim_512_depth_3'\
-    #             '_omit_unused_layer_batch_16_cls_loss_weight_0_5_classifier_pooling_max/latest.pth',
-    #             map_location='cpu')
-    # ret = model.base_model.load_state_dict(s['state_dict'], strict=True)
-    # model.load_state_dict(s['state_dict'], strict=True)
-
-    datasets = [build_dataset(cfg.data.train)]
-    if len(cfg.workflow) == 2:
-        val_dataset = copy.deepcopy(cfg.data.val)
-        val_dataset.pipeline = cfg.data.train.pipeline
-        datasets.append(build_dataset(val_dataset))
-    if cfg.checkpoint_config is not None:
-        # save mmseg version, config file content and class names in
-        # checkpoints as meta data
-        cfg.checkpoint_config.meta = dict(
-            config=cfg.pretty_text,
-            CLASSES=datasets[0].CLASSES,
-            PALETTE=datasets[0].PALETTE)
-    # add an attribute for visualization convenience
-    # model.CLASSES = datasets[0].CLASSES
-    # passing checkpoint meta for saving best checkpoint
-    meta.update(cfg.checkpoint_config.meta)
-    train_segmentor(
-        model,
-        datasets,
-        cfg,
-        distributed=distributed,
-        validate=(not args.no_validate),
-        timestamp=timestamp,
-        meta=meta,
-        only_eval=args.only_eval)
-
-
-if __name__ == '__main__':
-    main()
+    if 'test' in cfg.data:
+        test = cfg.data.test
+        test_dataset = build_dataset(test, dict(test_mode=True))
+        test_dataloader = build_dataloader(
+            test_dataset,
+            samples_per_gpu=1,
+            workers_per_gpu=cfg.data.workers_per_gpu,
+            dist=distributed,
+            shuffle=False)
+        test_cfg = cfg.get('evaluation', {})
+        test_cfg['by_epoch'] = cfg.runner['type'] != 'IterBasedRunner'
+        test_hook = DistEvalHook if distributed else EvalHook
+        test_cfg['interval'] = 1
+        test_hook(test_dataloader, **test_cfg)._do_evaluate(runner)
