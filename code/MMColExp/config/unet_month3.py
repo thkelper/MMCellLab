@@ -1,7 +1,10 @@
+IMG_EXT = ".bmp"
+MASK_EXT = ".tif"
+PRED_EXT = ".jpg"
 work_dir = './records'
 # dataset settings
-# dataset_type = 'MMDatasetV2'
-dataset_type="MaskSegDatasetv4"
+dataset_type = 'CollagenDataset'
+# dataset_type="MaskSegDatasetv4"
 img_norm_cfg = dict(
                     mean=[0.485, 0.456, 0.406], 
                     std=[0.229, 0.224, 0.225], 
@@ -58,12 +61,12 @@ test_pipeline = [
 
 data = dict(
     # samples_per_gpu=1,
-    samples_per_gpu=4,
+    samples_per_gpu=8,
     workers_per_gpu=8,
 
     train=dict(
             type=dataset_type,
-            data_root='/mnt/d/ycp/data/a549_col/month3',         
+            data_root='/mnt/d/ycp/data/format_mmlab_annotated_dataset',         
             # ann_path='train_head.txt',
             ann_path='train.txt',
             # edge_mask_dir='/mnt/disk1/data/image_forgery/CASIA2/edge_mask',
@@ -75,17 +78,11 @@ data = dict(
     val=[
         dict(
             type=dataset_type,
-            data_root='/mnt/d/ycp/data/a549_col/month3',
-            # data_root='/home/yangwu/data/image_forgery/CASIA1',
-            # data_root='/mnt/disk1/image_forgery/CASIA1',
+            data_root='/mnt/d/ycp/data/format_mmlab_annotated_dataset',
             # ann_path='test_head.txt',
             ann_path='test.txt',
             test_mode=True,
             pipeline=test_pipeline,
-            dataset_name='month3',
-            gt_seg_map_loader_cfg=dict(
-                                binary=True, 
-                                ),
         ),
     ]
 )
@@ -138,24 +135,24 @@ checkpoint_config = dict(by_epoch=False,
                         #  interval=1000,
                         # interval=3000,
                         # interval=2200,
-                        interval=300,
+                        interval=1000,
                         # interval=1500,
-                         max_keep_ckpts=1,
+                         max_keep_ckpts=3,
                         )
 # runtime settings
 runner = dict(type='IterBasedRunner',
                 # max_iters=21000)
                 # max_iters=63000)
                 # max_iters=45000)
-                max_iters=3000)
-                # max_iters=30000)
+                # max_iters=3000)
+                max_iters=30000)
                 # max_iters=5)
 
 evaluation = dict(
                 # interval=1500,
                 # interval=3000,
                 # interval=2200,
-                interval=300,
+                interval=1000,
                 # interval=1,
                 metric='mFscore',
                 pre_eval=True,
@@ -165,7 +162,7 @@ evaluation = dict(
                 )
 
 log_config = dict(
-    interval=50,
+    interval=500,
     # interval=1,
     hooks=[
         dict(type='TextLoggerHook', by_epoch=False),

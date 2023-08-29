@@ -45,7 +45,6 @@ class NestedUnetDetector(BaseModule, metaclass=ABCMeta):
         losses = dict()
 
         outs = self.base_model(img)
-        print(f"ttttest outs.shape: {outs.shape}")
         seg_loss = 0.0
         # for i, pred_mask in enumerate(outs):
         seg_loss = self.compute_seg_loss(*self.seg_losses, outs, gt_semantic_seg)
@@ -60,7 +59,6 @@ class NestedUnetDetector(BaseModule, metaclass=ABCMeta):
         assert all(_['ori_shape'] == ori_shape for _ in img_meta)
         # seg_logit = self.base_model(img)[0]
         seg_logit = self.base_model(img)
-        print(f"ttttest: seg_log.shape:{seg_logit.shape}")
         if img_meta[0]['pad_pre_shape'] is not None \
             and img_meta[0]['pad_shape'] is not None \
             and img_meta[0]['pad_shape'] != img_meta[0]['pad_pre_shape']:
@@ -90,9 +88,7 @@ class NestedUnetDetector(BaseModule, metaclass=ABCMeta):
         return seg_pred
 
     def simple_test(self, img, img_meta, rescale=True, argmax=False):
-        print(f"ttttest img.shape:{img.shape} \n img_meta:{img_meta}")
         seg_pred = self.inference(img, img_meta, rescale, argmax=argmax)
-        print(f"seg_pred.shape: {seg_pred.shape}")
         seg_pred = seg_pred.cpu().numpy()
         return seg_pred
 

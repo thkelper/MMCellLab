@@ -10,11 +10,11 @@ import mmcv
 import torch
 from mmengine.dist import get_dist_info, init_dist
 from mmengine import Config, DictAction, get_git_hash
-from image_forgery_detection.utils import (init_random_seed, set_random_seed, 
+from MMColExp.utils import (init_random_seed, set_random_seed, 
                           get_root_logger, collect_env, setup_multi_processes)
-from image_forgery_detection.train import train_segmentor
-from image_forgery_detection.models import build_detector, build_segmentor
-from image_forgery_detection.datasets import build_dataset 
+from MMColExp.train import train_segmentor
+from MMColExp.models import build_detector, build_segmentor
+from MMColExp.datasets import build_dataset 
 
 
 def parse_args():

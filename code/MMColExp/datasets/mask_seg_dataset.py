@@ -75,7 +75,7 @@ class MaskSegDataset(Dataset):
             load gt for evaluation, load from disk by default. Default: None.
     """
 
-    CLASSES = ['authentic', 'forgery']
+    CLASSES = ['medium', 'collagen']
 
     PALETTE = [0, 1]
 
@@ -980,121 +980,6 @@ class MaskSegDatasetv2(MaskSegDataset):
             results['img_label'] = 1
 
         return results
-
-
-from .auto_forging.forgery_dataset import ForgeryDataset
-@DATASETS.register_module()
-class MaskSegDatasetv3(MaskSegDataset):
-    def __init__(self,
-                 pipeline,
-                 data_root,
-                 ann_path=None,
-                 edge_mask_dir=None,
-                 test_mode=False,
-                 ignore_index=None,
-                 reduce_zero_label=False,
-                 classes=None,
-                 palette=None,
-                 gt_seg_map_loader_cfg=None,
-                 simulate_p=0.0,
-                 dataset_name='',
-                 metadata_file='',
-                 forging_configs=[],
-                 other_configs=[]
-                 ):
-        self.pipeline_cfg = pipeline
-        self.pre_pipelines = None
-        if mmcv.is_list_of(pipeline, list):
-            self.pre_pipelines = Compose(pipeline[0])
-            self.post_pipelines = Compose(pipeline[1])
-        else:
-            self.post_pipelines = Compose(pipeline)
-
-        self.data_root = data_root
-        self.ann_path = ann_path
-        self.edge_mask_dir = edge_mask_dir
-        self.test_mode = test_mode
-        self.ignore_index = ignore_index
-        self.reduce_zero_label = reduce_zero_label
-        self.label_map = None
-        self.CLASSES, self.PALETTE = self.get_classes_and_palette(
-            classes, palette)
-        self.simulate_p = simulate_p
-        self.dataset_name = dataset_name
-
-        self.forgery_dataset = ForgeryDataset(data_root, metadata_file, forging_configs, other_configs)
-
-        if test_mode:
-            assert self.CLASSES is not None, \
-                '`cls.CLASSES` or `classes` should be specified when testing'
-            
-        self.counter = 0
-
-    def prepare_train_img(self, idx):
-        """Get training data and annotations after pipeline.
-
-        Args:
-            idx (int): Index of data.
-
-        Returns:
-            dict: Training data and annotation after pipeline with new keys
-                introduced by pipeline.
-        """
-        results = self.forgery_pipline(idx)
-        results = self.post_pipelines(results)
-        return results
-    
-    def forgery_pipline(self, idx):
-        imgs, masks = self.forgery_dataset.auto_forging([idx])
-        # results contents:
-        # { 'img_info': img_info,
-        #   'ann_info': ann_info,
-        #   'seg_fields': [],
-        #   'img_prefix': self.img_dir,
-        #   'seg_prefix': self.ann_dir,
-        #   'filename': ,
-        #   'ori_filename': ,
-        #   'img': img,
-        #   'img_shape':  ,
-        #   'ori_shape': img.shape,
-        #   'pad_shape': img.shape,
-        #   'scale_factor': 1.0,
-        #   'img_norm_cfg': ,
-        #   'gt_semantic_seg': gt_semantic_seg,
-        #   'seg_fields': ['gt_semantic_seg']
-        # }
-        img, mask = imgs[0], masks[0]
-        mask[mask!=0] = 1
-
-        results = dict()
-
-        results['img'] = img
-        results['gt_semantic_seg'] = mask
-
-        results['img_shape'] = img.shape
-        results['ori_shape'] = img.shape
-        results['pad_shape'] = img.shape
-        results['scale_factor'] = 1.0
-        num_channels = 1 if len(img.shape) < 3 else img.shape[2]
-        results['img_norm_cfg'] = dict(
-            mean=np.zeros(num_channels, dtype=np.float32),
-            std=np.ones(num_channels, dtype=np.float32),
-            to_rgb=False)
-        
-        results['img_label'] = 0 if (mask == 0).all() else 1
-        
-        results['seg_fields'] = ['gt_semantic_seg']
-
-        # cv2.imwrite(f'./inspect/{self.counter}.jpg', img)
-        # cv2.imwrite(f'./inspect/{self.counter}_mask.jpg', mask)
-
-        self.counter += 1
-
-        return results
-
-    def __len__(self):
-        return len(self.forgery_dataset)
-
 
 
 @DATASETS.register_module()

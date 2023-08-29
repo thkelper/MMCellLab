@@ -1,120 +1,97 @@
-import os
 import os.path as osp
-import cv2
-import numpy as np
-import torch
-from collections import OrderedDict
-import torch.utils.data
-from .builder import DATASETS
-import mmcv
-from mmcv.utils import print_log
-from ..utils.logger import get_root_logger
-from .pipelines import Compose
 import warnings
+import random
+from collections import OrderedDict
+import mmcv
+import os
+import numpy as np
+import copy
+import cv2
+from sklearn import metrics
+from mmcv.utils import print_log
+from prettytable import PrettyTable
+from torch.utils.data import Dataset
+import pytesseract as pt
+from .pipelines import Compose, LoadAnnotations
+from ..utils.logger import get_root_logger
 from ..utils.evaluate import (intersect_and_union, eval_metrics, pre_eval_to_metrics,
                             calculate_auc, calculate_img_score)
-from prettytable import PrettyTable
-from .pipelines import Compose, LoadAnnotations
-from sklearn import metrics
-            
-
-@DATASETS.register_module()
-class Dataset(torch.utils.data.Dataset):
-    CLASSES = ["medium", "collagen"]
-    PALETTE = [0, 1]
-    def __init__(self, img_ids, img_dir, mask_dir, img_ext, mask_ext, num_classes, transform=None):
-        """
-        Args:
-            img_ids (list): Image ids.
-            img_dir: Image file directory.
-            mask_dir: Mask file directory.
-            img_ext (str): Image file extension.
-            mask_ext (str): Mask file extension.
-            num_classes (int): Number of classes.
-            transform (Compose, optional): Compose transforms of albumentations. Defaults to None.
-        
-        Note:
-            Make sure to put the files as the following structure:
-            <dataset name>
-            ├── images
-            |   ├── 0a7e06.jpg
-            │   ├── 0aab0a.jpg
-            │   ├── 0b1761.jpg
-            │   ├── ...
-            |
-            └── masks
-                ├── 0
-                |   ├── 0a7e06.png
-                |   ├── 0aab0a.png
-                |   ├── 0b1761.png
-                |   ├── ...
-                |
-                ├── 1
-                |   ├── 0a7e06.png
-                |   ├── 0aab0a.png
-                |   ├── 0b1761.png
-                |   ├── ...
-                ...
-        """
-        self.img_ids = img_ids
-        self.img_dir = img_dir
-        self.mask_dir = mask_dir
-        self.img_ext = img_ext
-        self.mask_ext = mask_ext
-        self.num_classes = num_classes
-        self.transform = transform
-
-    def __len__(self):
-        return len(self.img_ids)
-
-    def __getitem__(self, idx):
-        img_id = self.img_ids[idx]
-        
-        img = cv2.imread(os.path.join(self.img_dir, img_id + self.img_ext))
-
-        mask = []
-        for i in range(self.num_classes):
-            mask.append(cv2.imread(os.path.join(self.mask_dir, str(i),
-                        img_id + self.mask_ext), cv2.IMREAD_GRAYSCALE)[..., None])
-        mask = np.dstack(mask)
-
-        if self.transform is not None:
-            augmented = self.transform(image=img, mask=mask)#这个包比较方便，能把mask也一并做掉
-            img = augmented['image']#参考https://github.com/albumentations-team/albumentations
-            mask = augmented['mask']
-        
-        img = img.astype('float32') / 255
-        img = img.transpose(2, 0, 1)
-        mask = mask.astype('float32') / 255
-        mask = mask.transpose(2, 0, 1)
-        
-        return img, mask, {'img_id': img_id}
+from .builder import DATASETS
+from torch.utils.data import Dataset
 
 
 @DATASETS.register_module()
-# class MMDataset(torch.utils.data.Dataset):
-class MMDataset(Dataset):
-    CLASSES = ["medium", "collagen"]
-    PALETTE = [0, 1]
+class CollagenDataset(Dataset):
+    """Custom dataset for semantic segmentation. An example of file structure
+    is as followed.
 
+    .. code-block:: none
+
+        ├── data
+        │   ├── my_dataset
+        │   │   ├── img_dir
+        │   │   │   ├── train
+        │   │   │   │   ├── xxx{img_suffix}
+        │   │   │   │   ├── yyy{img_suffix}
+        │   │   │   │   ├── zzz{img_suffix}
+        │   │   │   ├── val
+        │   │   ├── ann_dir
+        │   │   │   ├── train
+        │   │   │   │   ├── xxx{seg_map_suffix}
+        │   │   │   │   ├── yyy{seg_map_suffix}
+        │   │   │   │   ├── zzz{seg_map_suffix}
+        │   │   │   ├── val
+
+    The img/gt_semantic_seg pair of CustomDataset should be of the same
+    except suffix. A valid img/gt_semantic_seg filename pair should be like
+    ``xxx{img_suffix}`` and ``xxx{seg_map_suffix}`` (extension is also included
+    in the suffix). If split is given, then ``xxx`` is specified in txt file.
+    Otherwise, all files in ``img_dir/``and ``ann_dir`` will be loaded.
+    Please refer to ``docs/en/tutorials/new_dataset.md`` for more details.
+
+
+    Args:
+        pipeline (list[dict]): Processing pipeline
+        img_dir (str): Path to image directory
+        img_suffix (str): Suffix of images. Default: '.jpg'
+        ann_dir (str, optional): Path to annotation directory. Default: None
+        seg_map_suffix (str): Suffix of segmentation maps. Default: '.png'
+        split (str, optional): Split txt file. If split is specified, only
+            file with suffix in the splits will be loaded. Otherwise, all
+            images in img_dir/ann_dir will be loaded. Default: None
+        data_root (str, optional): Data root for img_dir/ann_dir. Default:
+            None.
+        test_mode (bool): If test_mode=True, gt wouldn't be loaded.
+        ignore_index (int): The label index to be ignored. Default: 255
+        reduce_zero_label (bool): Whether to mark label zero as ignored.
+            Default: False
+        classes (str | Sequence[str], optional): Specify classes to load.
+            If is None, ``cls.CLASSES`` will be used. Default: None.
+        palette (Sequence[Sequence[int]]] | np.ndarray | None):
+            The palette of segmentation map. If None is given, and
+            self.PALETTE is None, random palette will be generated.
+            Default: None
+        gt_seg_map_loader_cfg (dict, optional): build LoadAnnotations to
+            load gt for evaluation, load from disk by default. Default: None.
+    """
+
+    CLASSES = ['medium', 'collagen']
+
+    PALETTE = [[0, 0, 0], [255, 255, 255]]
     def __init__(self,
                  pipeline,
-                 img_dir,
-                 img_suffix='.bmp',
-                 ann_dir=None,
-                 seg_map_suffix='.tif',
-                 split=None,
-                 data_root=None,
-                 test_mode=True,
+                 data_root,
+                 ann_path,
+                 edge_mask_dir=None,
+                 test_mode=False,
                  ignore_index=None,
                  reduce_zero_label=False,
                  classes=None,
                  palette=None,
                  gt_seg_map_loader_cfg=None,
-                 simulate_p=0.5,
-                 dataset_name='',
-                 **unused_kwargs,
-                 ) -> None:
+                 simulate_p=0.0,
+                 dataset_name=''):
+        self.pipeline_cfg = pipeline
         self.pre_pipelines = None
         if mmcv.is_list_of(pipeline, list):
             self.pre_pipelines = Compose(pipeline[0])
@@ -122,103 +99,167 @@ class MMDataset(Dataset):
         else:
             self.post_pipelines = Compose(pipeline)
 
-        self.img_dir = img_dir
-        self.img_suffix = img_suffix
-        self.ann_dir = ann_dir
-        self.seg_map_suffix = seg_map_suffix
-        self.split = split
         self.data_root = data_root
-        self.test_mode = test_mode        
+        self.ann_path = ann_path
+        self.edge_mask_dir = edge_mask_dir
+        self.test_mode = test_mode
         self.ignore_index = ignore_index
         self.reduce_zero_label = reduce_zero_label
         self.label_map = None
-        self.CLASSES, self.PALETTE = self.get_classes_and_palette
-
+        self.CLASSES, self.PALETTE = self.get_classes_and_palette(
+            classes, palette)
         self.gt_seg_map_loader = LoadAnnotations(binary=True
         ) if gt_seg_map_loader_cfg is None else LoadAnnotations(
             **gt_seg_map_loader_cfg)
+        self.simulate_p = simulate_p
         self.dataset_name = dataset_name
 
         if test_mode:
             assert self.CLASSES is not None, \
-            '`cls.CLASSES` or `classes` should be specified when testing'
+                '`cls.CLASSES` or `classes` should be specified when testing'
 
-        if self.data_root is not None:
-            if not osp.isabs(self.img_dir):
-                self.img_dir = osp.join(self.data_root, self.img_dir)
-            if not (self.ann_dir is None or osp.isabs(self.ann_dir)):
-                self.ann_dir = osp.join(self.data_root, self.ann_dir)
-            if not (self.split is None or osp.isabs(self.split)):
-                    self.split = osp.join(self.data_root, self.split)
+        # load annotations
+        self.img_infos = self.load_annotations()
+
+    def load_annotations(self):
+        img_infos = []
+
+        anno_path = osp.join(self.data_root, self.ann_path)
+        with open(anno_path) as f:
+            lines = [line.strip() for line in f.readlines()]
+    
+        for line in lines:
+            try:
+                img_path, gt_path_= line.split(' ')
+            except Exception as e:
+                print(line)
+                raise e
+
+            img_path = osp.join(self.data_root, img_path)
+            gt_path = osp.join(self.data_root, gt_path_)
+
+            if not osp.isfile(img_path):
+                continue
+            if gt_path_ != 'None' and not osp.isfile(gt_path):
+                continue
+
+            img_info = dict(filename=img_path)
+            img_info['ann'] = dict(seg_map=gt_path)
+            # img_info['ann']['img_label'] = int(label)
+            if self.edge_mask_dir:
+                img_info['ann']['edge_mask'] = osp.join(self.edge_mask_dir, osp.basename(gt_path))
+            img_infos.append(img_info)                
+
+        # img_infos = sorted(img_infos, key=lambda x: x['filename'])
+
+        print_log(f'Loaded {len(img_infos)} images', logger=get_root_logger())
+        return img_infos
 
 
-        self.img_infos = self.load_annotations(self.img_dir, self.img_suffix,
-                                               self.ann_dir, self.seg_map_suffix,
-                                                self.split)
+    def __len__(self):
+        """Total number of samples of data."""
+        # if self.test_mode:
+        #     return 50
+        return len(self.img_infos)
 
-        def __len__(self):
-            return len(self.img_infos)
-        
-        def load_annotations(self, img_dir, img_suffix, ann_dir, seg_map_suffix, split):
-            
-            img_infos = []
-            if split is not None:
-                with open(split) as f:
-                    for line in f:
-                        img_name = line.strip()
-                        img_info = dict(filename=img_name + img_suffix)
-                        if ann_dir is not None:
-                            seg_map = img_name + seg_map_suffix
-                            img_info['ann'] = dict(seg_map=seg_map)
-                        img_infos.append(img_info)
-            else:
-                for img in mmcv.scandir(img_dir,  img_suffix, recursive=True):
-                    img_info = dict(filename=img)
-                    if ann_dir is not None:
-                        seg_map = img.replace(img_suffix, seg_map_suffix)
-                        img_info['ann'] = dict(seg_map=seg_map)
-                    img_infos.append(img_info)
-                img_infos = sorted(img_infos, key=lambda x: x['filename'])
-            
-            print_log(f'Loaded {len(img_infos)} images', logger=get_root_logger())
-            return img_infos       
+
 
     def get_ann_info(self, idx):
+        """Get annotation by index.
+
+        Args:
+            idx (int): Index of data.
+
+        Returns:
+            dict: Annotation info of specified index.
+        """
+
         return self.img_infos[idx]['ann']
 
     def get_img_info(self, idx):
         return self.img_infos[idx]
-    
-    def pre_pipeline(self, results):
-        results['seg_fields'] = []
-        results['img_prefix'] = self.img_dir
-        results['seg_prefix'] = self.ann_dir
+
+
 
     def __getitem__(self, idx):
+        """Get training/test data after pipeline.
+
+        Args:
+            idx (int): Index of data.
+
+        Returns:
+            dict: Training/test data (with annotation if `test_mode` is set
+                False).
+        """
+
+        # results contents:
+        # { 'img_info': img_info,
+        #   'ann_info': ann_info,
+        #   'seg_fields': [],
+        #   'img_prefix': self.img_dir,
+        #   'seg_prefix': self.ann_dir,
+        #   'filename': ,
+        #   'ori_filename': ,
+        #   'img': img,
+        #   'img_shape':  ,
+        #   'ori_shape': img.shape,
+        #   'pad_shape': img.shape,
+        #   'scale_factor': 1.0,
+        #   'img_norm_cfg': ,
+        #   'gt_semantic_seg': gt_semantic_seg,
+        #   'seg_fields': ['gt_semantic_seg']
+        # }
         if self.test_mode:
             return self.prepare_test_img(idx)
         else:
             ret = self.prepare_train_img(idx)
+            # print(ret)
             return ret
-            
+
+
     def prepare_train_img(self, idx):
+        """Get training data and annotations after pipeline.
+
+        Args:
+            idx (int): Index of data.
+
+        Returns:
+            dict: Training data and annotation after pipeline with new keys
+                introduced by pipeline.
+        """
         img_info = self.img_infos[idx]
         ann_info = self.get_ann_info(idx)
-        results = dict(img_info=img_info, ann_info=ann_info) 
+        results = dict(img_info=img_info, ann_info=ann_info)
         self.pre_pipeline(results)
         if self.pre_pipelines:
-            results = self.pre_pipelines(results) 
-            #results = self.multi_rand_aug(results)
+            results = self.pre_pipelines(results)
+            # results = self.multi_rand_aug(results)
         results = self.post_pipelines(results)
-
         return results
+    
+
+    def pre_pipeline(self, results):
+        """Prepare results dict for pipeline."""
+        results['seg_fields'] = []
+        results['img_prefix'] = None
+        results['seg_prefix'] = None
 
 
     def prepare_test_img(self, idx):
+        """Get testing data after pipeline.
+
+        Args:
+            idx (int): Index of data.
+
+        Returns:
+            dict: Testing data after pipeline with new keys introduced by
+                pipeline.
+        """
+
         try:
             img_info = self.img_infos[idx]
             results = dict(img_info=img_info)
-            self.prepiline(results)
+            self.pre_pipeline(results)
             if self.pre_pipelines:
                 results = self.pre_pipelines(results)
             results = self.post_pipelines(results)
@@ -226,21 +267,27 @@ class MMDataset(Dataset):
             raise e
         return results
 
+    # def format_results(self, results, imgfile_prefix, indices=None, **kwargs):
+    #     """Place holder to format result to dataset specific output."""
+    #     raise NotImplementedError
 
     def get_gt_seg_map_by_idx(self, index):
+        """Get one ground truth segmentation map for evaluation."""
         ann_info = self.get_ann_info(index)
         results = dict(ann_info=ann_info)
         self.pre_pipeline(results)
-        self.get_seg_map_loader(results)
+        self.gt_seg_map_loader(results)
+        # return results['gt_semantic_seg']
         return results
 
     def get_gt_seg_maps(self, efficient_test=None):
+        """Get ground truth segmentation maps for evaluation."""
         if efficient_test is not None:
             warnings.warn(
                 'DeprecationWarning: ``efficient_test`` has been deprecated '
                 'since MMSeg v0.16, the ``get_gt_seg_maps()`` is CPU memory '
                 'friendly by default. ')
-        
+
         for idx in range(len(self)):
             ann_info = self.get_ann_info(idx)
             results = dict(ann_info=ann_info)
@@ -282,44 +329,39 @@ class MMDataset(Dataset):
             seg_gt = annos.get('gt_semantic_seg', None)
             if seg_gt is not None:
                 seg_gt = seg_gt.astype(seg_pred.dtype)
-            img_gt = annos['img_label']
 
             # if img_gt > 0 and seg_gt.max() > 0:
-            if img_gt > 0:
-                # if seg_gt.max() == 0.:
-                    # print(self.img_infos[index]['ann']['seg_map'])
+            # if seg_gt.max() == 0.:
+                # print(self.img_infos[index]['ann']['seg_map'])
 
-                if thresh is None:
-                    seg_pred_ = seg_pred.flatten()
-                    seg_gt_ = seg_gt.astype(np.int).flatten()
+            if thresh is None:
+                seg_pred_ = seg_pred.flatten()
+                seg_gt_ = seg_gt.astype(np.int).flatten()
 
-                    tpr, fpr, thresholds = metrics.roc_curve(seg_gt_, seg_pred_, pos_label=1)
-                    max_index = (tpr-fpr).argmax()
-                    thresh = thresholds[max_index]
+                tpr, fpr, thresholds = metrics.roc_curve(seg_gt_, seg_pred_, pos_label=1)
+                max_index = (tpr-fpr).argmax()
+                thresh = thresholds[max_index]
 
-                pred_l = (seg_pred > thresh).astype(np.float32)
+            pred_l = (seg_pred > thresh).astype(np.float32)
 
-                iou = intersect_and_union(pred_l, 
-                                         seg_gt, 
-                                         len(self.CLASSES),
-                                         self.ignore_index, 
-                                         self.label_map,
-                                         self.reduce_zero_label)
-                try:
-                    auc = calculate_auc(seg_pred.flatten(), seg_gt.flatten())
-                except ValueError as e:
-                    auc = None
-            else:
-                iou = None
+            iou = intersect_and_union(pred_l, 
+                                        seg_gt, 
+                                        len(self.CLASSES),
+                                        self.ignore_index, 
+                                        self.label_map,
+                                        self.reduce_zero_label)
+            try:
+                auc = calculate_auc(seg_pred.flatten(), seg_gt.flatten())
+            except ValueError as e:
                 auc = None
 
+
             score = np.max(seg_pred) if cls_pred is None else cls_pred
-            img_eval = [img_gt, score]
+            img_eval = [score]
 
             pre_eval_results.append({'iou': iou, 'auc': auc, 'img_eval': img_eval})
 
         return pre_eval_results
-
 
     def get_classes_and_palette(self, classes=None, palette=None):
         """Get class names of current dataset.
@@ -392,7 +434,10 @@ class MMDataset(Dataset):
                 ret_metrics['pixel_auc'] = np.array(aucs)
 
             img_eval = [result['img_eval'] for result in results if 'img_eval' in result and result['img_eval'] is not None]
-            gts = np.array([item[0] for item in img_eval]).astype(np.int32).flatten()
+            
+            # gts = np.array([item[0] for item in img_eval]).astype(np.int32).flatten()
+            gts = np.array([item[0] for item in img_eval]).astype(np.int32)
+            print(f"ttttest gts.shape{gts.shape}")
             scores = np.array([item[1] for item in img_eval])
             if len(img_eval) > 0 and gts.min() == 0:
                 img_auc = calculate_auc(scores, gts)
@@ -493,89 +538,3 @@ class MMDataset(Dataset):
             eval_results[log_dataset_name+k] = v
 
         return eval_results
-
-
-@DATASETS.register_module()
-class MMDatasetV2(MMDataset):
-    def __init__(self,
-                 pipeline,
-                 data_root,
-                 ann_path,
-                 img_dir=None,
-                 edge_mask_dir=None,
-                 test_mode=False,
-                 ignore_index=None,
-                 reduce_zero_label=False,
-                 classes=None,
-                 palette=None,
-                 gt_seg_map_loader_cfg=None,
-                 simulate_p=0.0,
-                 dataset_name=''):
-        self.pipeline_cfg = pipeline
-        self.pre_pipelines = None
-        if mmcv.is_list_of(pipeline, list):
-            self.pre_pipelines = Compose(pipeline[0])
-            self.post_pipelines = Compose(pipeline[1])
-        else:
-            self.post_pipelines = Compose(pipeline)
-
-        self.data_root = data_root
-        if self.data_root is not None:
-            if not osp.isabs(self.img_dir):
-                self.img_dir = osp.join(self.data_root, self.img_dir)
-        self.ann_path = ann_path
-        self.edge_mask_dir = edge_mask_dir
-        self.test_mode = test_mode
-        self.ignore_index = ignore_index
-        self.reduce_zero_label = reduce_zero_label
-        self.label_map = None
-        self.CLASSES, self.PALETTE = self.get_classes_and_palette(
-            classes, palette)
-        self.gt_seg_map_loader = LoadAnnotations(binary=True
-        ) if gt_seg_map_loader_cfg is None else LoadAnnotations(
-            **gt_seg_map_loader_cfg)
-        self.simulate_p = simulate_p
-        self.dataset_name = dataset_name
-
-        if test_mode:
-            assert self.CLASSES is not None, \
-                '`cls.CLASSES` or `classes` should be specified when testing'
-
-        # load annotations
-        self.img_infos = self.load_annotations()
-
-    def __len__(self):
-        return len(self.img_infos)
-
-    def load_annotations(self):
-        img_infos = []
-
-        anno_path = osp.join(self.data_root, self.ann_path)
-        with open(anno_path) as f:
-            lines = [line.strip() for line in f.readlines()]
-    
-        for line in lines:
-            try:
-                img_path, gt_path_= line.split(' ')
-            except Exception as e:
-                print(line)
-                raise e
-
-            img_path = osp.join(self.data_root, img_path)
-            gt_path = osp.join(self.data_root, gt_path_)
-
-            if not osp.isfile(img_path):
-                continue
-            if gt_path_ != 'None' and not osp.isfile(gt_path):
-                continue
-
-            img_info = dict(filename=img_path)
-            img_info['ann'] = dict(seg_map=gt_path)
-            if self.edge_mask_dir:
-                img_info['ann']['edge_mask'] = osp.join(self.edge_mask_dir, osp.basename(gt_path))
-            img_infos.append(img_info)                
-
-        # img_infos = sorted(img_infos, key=lambda x: x['filename'])
-
-        print_log(f'Loaded {len(img_infos)} images', logger=get_root_logger())
-        return img_infos
